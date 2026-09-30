@@ -1,5 +1,4 @@
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -51,7 +50,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "yt_dlp": shutil.which("yt-dlp") or "python-module",
+        "yt_dlp": shutil.which("yt-dlp") or "missing",
         "ffmpeg": shutil.which("ffmpeg") or "missing"
     }
 
@@ -62,7 +61,10 @@ def download_media(request: DownloadRequest):
     media_type = request.type.strip().lower()
 
     if not url:
-        raise HTTPException(status_code=400, detail="Instagram URL is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram URL is required."
+        )
 
     validate_instagram_url(url)
 
@@ -73,7 +75,6 @@ def download_media(request: DownloadRequest):
         )
 
     temp_dir = Path(tempfile.mkdtemp(prefix="instagram-"))
-
     output_template = str(temp_dir / "%(id)s.%(ext)s")
 
     command = [
@@ -81,10 +82,15 @@ def download_media(request: DownloadRequest):
         "--no-playlist",
         "--no-warnings",
         "--restrict-filenames",
+
+        # Explicitly request video + separate audio.
         "-f",
-        "bestvideo+bestaudio/best",
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+
+        # Force the final container to MP4.
         "--merge-output-format",
         "mp4",
+
         "-o",
         output_template,
         url,
@@ -120,7 +126,6 @@ def download_media(request: DownloadRequest):
             path=str(video),
             media_type="video/mp4",
             filename="instagram-video.mp4",
-            background=None,
         )
 
     except subprocess.TimeoutExpired:
@@ -128,8 +133,3 @@ def download_media(request: DownloadRequest):
             status_code=504,
             detail="Download timed out."
         )
-
-    finally:
-        # Render filesystem is ephemeral anyway; clean temporary files
-        # after processing where possible.
-        pass
