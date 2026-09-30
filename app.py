@@ -77,12 +77,15 @@ def download_media(request: DownloadRequest):
         "--no-playlist",
         "--restrict-filenames",
 
+        # Require separate video + audio streams.
         "-f",
-        "bestvideo[height>=1080]+bestaudio/bestvideo+bestaudio/best",
+        "bestvideo+bestaudio",
 
+        # Prefer the highest resolution and bitrate available.
         "-S",
         "res,fps,br",
 
+        # Merge the two streams into MP4.
         "--merge-output-format",
         "mp4",
 
@@ -91,7 +94,7 @@ def download_media(request: DownloadRequest):
         url,
     ]
 
-    print("RUNNING YT-DLP:")
+    print("RUNNING YT-DLP:", flush=True)
     print(" ".join(command), flush=True)
 
     try:
@@ -106,12 +109,18 @@ def download_media(request: DownloadRequest):
 
         print("YT-DLP OUTPUT:", flush=True)
         print(result.stdout, flush=True)
-        print(f"YT-DLP RETURN CODE: {result.returncode}", flush=True)
+        print(
+            f"YT-DLP RETURN CODE: {result.returncode}",
+            flush=True
+        )
 
         if result.returncode != 0:
             raise HTTPException(
                 status_code=502,
-                detail="Instagram download failed."
+                detail=(
+                    "Instagram download failed. "
+                    "Video/audio format selection failed."
+                )
             )
 
         mp4_files = list(temp_dir.glob("*.mp4"))
