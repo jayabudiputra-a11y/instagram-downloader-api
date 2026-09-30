@@ -1,4 +1,3 @@
-import os
 import shutil
 import subprocess
 import tempfile
@@ -83,11 +82,17 @@ def download_media(request: DownloadRequest):
         "--no-warnings",
         "--restrict-filenames",
 
-        # Explicitly request video + separate audio.
+        # Prefer 1080p video, then 720p or the best available.
         "-f",
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "bestvideo[height>=1080]+bestaudio/"
+        "bestvideo[height>=720]+bestaudio/"
+        "bestvideo+bestaudio/best",
 
-        # Force the final container to MP4.
+        # Prefer the highest available resolution/quality.
+        "-S",
+        "res,fps,br",
+
+        # Always merge separate video/audio into MP4.
         "--merge-output-format",
         "mp4",
 
@@ -121,6 +126,38 @@ def download_media(request: DownloadRequest):
             )
 
         video = mp4_files[0]
+
+        # Verify that the final MP4 contains both video and audio.
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(video),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+
+        stream_types = probe.stdout
+
+        if "codec_type=video" not in stream_types:
+            raise HTTPException(
+                status_code=502,
+                detail="Final MP4 does not contain a video stream."
+            )
+
+        if "codec_type=audio" not in stream_types:
+            raise HTTPException(
+                status_code=502,
+                detail="Final MP4 does not contain an audio stream."
+            )
 
         return FileResponse(
             path=str(video),
