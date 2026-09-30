@@ -17,11 +17,7 @@ class DownloadRequest(BaseModel):
 
 
 def validate_instagram_url(url: str):
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid URL.")
-
+    parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
 
     allowed = {
@@ -79,20 +75,14 @@ def download_media(request: DownloadRequest):
     command = [
         "yt-dlp",
         "--no-playlist",
-        "--no-warnings",
         "--restrict-filenames",
 
-        # Prefer 1080p video, then 720p or the best available.
         "-f",
-        "bestvideo[height>=1080]+bestaudio/"
-        "bestvideo[height>=720]+bestaudio/"
-        "bestvideo+bestaudio/best",
+        "bestvideo[height>=1080]+bestaudio/bestvideo+bestaudio/best",
 
-        # Prefer the highest available resolution/quality.
         "-S",
         "res,fps,br",
 
-        # Always merge separate video/audio into MP4.
         "--merge-output-format",
         "mp4",
 
@@ -100,6 +90,9 @@ def download_media(request: DownloadRequest):
         output_template,
         url,
     ]
+
+    print("RUNNING YT-DLP:")
+    print(" ".join(command), flush=True)
 
     try:
         result = subprocess.run(
@@ -110,6 +103,10 @@ def download_media(request: DownloadRequest):
             timeout=120,
             check=False,
         )
+
+        print("YT-DLP OUTPUT:", flush=True)
+        print(result.stdout, flush=True)
+        print(f"YT-DLP RETURN CODE: {result.returncode}", flush=True)
 
         if result.returncode != 0:
             raise HTTPException(
@@ -127,14 +124,15 @@ def download_media(request: DownloadRequest):
 
         video = mp4_files[0]
 
-        # Verify that the final MP4 contains both video and audio.
         probe = subprocess.run(
             [
                 "ffprobe",
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=codec_type",
+                "stream=index,codec_type,codec_name,width,height,channels,sample_rate",
+                "-show_entries",
+                "format=duration",
                 "-of",
                 "default=noprint_wrappers=1",
                 str(video),
@@ -145,15 +143,16 @@ def download_media(request: DownloadRequest):
             check=False,
         )
 
-        stream_types = probe.stdout
+        print("FINAL FILE PROBE:", flush=True)
+        print(probe.stdout, flush=True)
 
-        if "codec_type=video" not in stream_types:
+        if "codec_type=video" not in probe.stdout:
             raise HTTPException(
                 status_code=502,
                 detail="Final MP4 does not contain a video stream."
             )
 
-        if "codec_type=audio" not in stream_types:
+        if "codec_type=audio" not in probe.stdout:
             raise HTTPException(
                 status_code=502,
                 detail="Final MP4 does not contain an audio stream."
