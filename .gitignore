@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets
+instagram-cookies.txt
+.env
+.env.*
+!.env.example
+
+# Local test / downloaded media
+*.mp4
+*.m4a
+*.webm
+*.mov
+*.avi
+*.mkv
+
+# Diagnostic output
+*.json
+*.html
+*.txt
+
+# Backups
+*.bak
+*.backup
+*.old
+
+# Railway-only files
+.railwayignore
+
+# Local diagnostic scripts
+diagnose-railway-vs-local-raw-audio.ps1
+
+# Backup directories
+backup-*/
