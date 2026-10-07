@@ -50,6 +50,7 @@ def validate_audio_url(url: str):
     allowed_hosts = (
         "fbcdn.net",
         "instagram.com",
+        "cdninstagram.com",
     )
 
     if not any(host == h or host.endswith("." + h) for h in allowed_hosts):
