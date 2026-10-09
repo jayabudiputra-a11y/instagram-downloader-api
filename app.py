@@ -11,6 +11,7 @@ import urllib.request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 
@@ -21,6 +22,7 @@ class DownloadRequest(BaseModel):
     url: str
     type: str = "video"
     audio_url: str | None = None
+    media_url: str | None = None
 
 
 def validate_instagram_url(url: str):
@@ -53,10 +55,37 @@ def validate_audio_url(url: str):
         "cdninstagram.com",
     )
 
-    if not any(host == h or host.endswith("." + h) for h in allowed_hosts):
+    if parsed.scheme not in ("http", "https") or not any(
+        host == h or host.endswith("." + h) for h in allowed_hosts
+    ):
         raise HTTPException(
             status_code=400,
             detail="Invalid Instagram audio URL host."
+        )
+
+
+def validate_media_url(url: str):
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="Media URL is required."
+        )
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    allowed_hosts = (
+        "fbcdn.net",
+        "instagram.com",
+        "cdninstagram.com",
+    )
+
+    if parsed.scheme not in ("http", "https") or not any(
+        host == h or host.endswith("." + h) for h in allowed_hosts
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Instagram media URL host."
         )
 
 
@@ -117,9 +146,9 @@ def health():
     }
 
 
-def run_command(command):
-    print("RUNNING:", flush=True)
-    print(" ".join(command), flush=True)
+def run_command(command, cwd=None, suppress_output=False):
+    print("RUNNING COMMAND", flush=True)
+    print(f"COMMAND ARGUMENTS REDACTED (count={len(command)})", flush=True)
 
     result = subprocess.run(
         command,
@@ -128,16 +157,179 @@ def run_command(command):
         text=True,
         timeout=180,
         check=False,
+        cwd=str(cwd) if cwd else None,
     )
 
-    print("COMMAND OUTPUT:", flush=True)
-    print(result.stdout, flush=True)
-    print(
-        f"RETURN CODE: {result.returncode}",
-        flush=True
-    )
+    if not suppress_output:
+        output_length = len(result.stdout or "")
+        output_lines = len((result.stdout or "").splitlines())
+        print(
+            f"COMMAND OUTPUT REDACTED (characters={output_length}, lines={output_lines})",
+            flush=True,
+        )
 
+    print(f"RETURN CODE: {result.returncode}", flush=True)
     return result
+
+
+def parse_yt_dlp_json(raw: str):
+    raw = (raw or "").strip()
+
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+
+    for index, char in enumerate(raw):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(raw[index:])
+            if isinstance(value, dict) and (
+                "id" in value or "entries" in value or "_type" in value
+            ):
+                return value
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("No valid yt-dlp JSON object was found.")
+
+
+def extract_carousel_items(temp_dir: Path):
+    """Parse Instagram's captured carousel JSON without logging signed media URLs."""
+    for dump_path in temp_dir.glob("*.dump"):
+        try:
+            raw = dump_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        search_offset = 0
+
+        while True:
+            key_index = raw.find('"carousel_media"', search_offset)
+            if key_index < 0:
+                break
+
+            colon_index = raw.find(":", key_index + len('"carousel_media"'))
+            if colon_index < 0:
+                break
+
+            array_start = colon_index + 1
+            while array_start < len(raw) and raw[array_start].isspace():
+                array_start += 1
+
+            search_offset = key_index + 1
+
+            if array_start >= len(raw) or raw[array_start] != "[":
+                continue
+
+            depth = 0
+            in_string = False
+            escaped = False
+            array_end = -1
+
+            for index in range(array_start, len(raw)):
+                char = raw[index]
+
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+
+                if char == '"':
+                    in_string = True
+                elif char == "[":
+                    depth += 1
+                elif char == "]":
+                    depth -= 1
+                    if depth == 0:
+                        array_end = index
+                        break
+
+            if array_end < array_start:
+                continue
+
+            try:
+                items = json.loads(raw[array_start:array_end + 1])
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(items, list) or len(items) < 2:
+                continue
+
+            results = []
+
+            for position, item in enumerate(items, start=1):
+                if not isinstance(item, dict):
+                    continue
+
+                image_candidates = [
+                    candidate
+                    for candidate in (
+                        (item.get("image_versions2") or {}).get("candidates") or []
+                    )
+                    if isinstance(candidate, dict) and candidate.get("url")
+                ]
+
+                video_candidates = [
+                    candidate
+                    for candidate in (item.get("video_versions") or [])
+                    if isinstance(candidate, dict) and candidate.get("url")
+                ]
+
+                def resolution_score(candidate):
+                    try:
+                        return int(candidate.get("width") or 0) * int(
+                            candidate.get("height") or 0
+                        )
+                    except (TypeError, ValueError):
+                        return 0
+
+                best_image = max(image_candidates, key=resolution_score, default={})
+                best_video = max(video_candidates, key=resolution_score, default={})
+
+                media_type = item.get("media_type")
+                is_video = media_type == 2 or "Video" in str(
+                    item.get("__typename") or ""
+                )
+                media_url = (
+                    best_video.get("url") if is_video else best_image.get("url")
+                )
+
+                thumbnail = (
+                    item.get("display_uri")
+                    or best_image.get("url")
+                    or item.get("thumbnail_src")
+                    or ""
+                )
+
+                results.append({
+                    "position": position,
+                    "id": str(item.get("code") or item.get("id") or ""),
+                    "type": "video" if is_video else "image",
+                    "media_type": media_type,
+                    "width": item.get("original_width"),
+                    "height": item.get("original_height"),
+                    "thumbnail": thumbnail,
+                    "image_url": best_image.get("url") or thumbnail,
+                    "video_url": best_video.get("url") or "",
+                    "media_url": media_url or "",
+                    "has_video": bool(video_candidates),
+                    "has_audio": False,
+                })
+
+            if len(results) >= 2:
+                return results
+
+    return []
 
 
 def probe_file(media: Path):
@@ -242,9 +434,10 @@ def metadata(url: str):
         tempfile.mkdtemp(prefix="instagram-metadata-")
     )
 
-    cookie_path = prepare_instagram_cookies(temp_dir)
+    cookie_path = None
 
     try:
+        cookie_path = prepare_instagram_cookies(temp_dir)
         print("========================================", flush=True)
         print("INSTAGRAM METADATA EXTRACTION", flush=True)
         print("========================================", flush=True)
@@ -255,6 +448,7 @@ def metadata(url: str):
             "--skip-download",
             "--no-warnings",
             "--dump-single-json",
+            "--write-pages",
             "--no-check-certificates",
         ]
 
@@ -266,7 +460,11 @@ def metadata(url: str):
 
         command.append(url)
 
-        result = run_command(command)
+        result = run_command(
+            command,
+            cwd=temp_dir,
+            suppress_output=True,
+        )
 
         if result.returncode != 0:
             raise HTTPException(
@@ -283,13 +481,14 @@ def metadata(url: str):
             )
 
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+            data = parse_yt_dlp_json(raw)
+        except ValueError:
             raise HTTPException(
                 status_code=502,
                 detail="yt-dlp returned invalid JSON."
             )
 
+        media_items = extract_carousel_items(temp_dir)
         formats = []
 
         video_url = ""
@@ -375,16 +574,15 @@ def metadata(url: str):
             "video_url": video_url,
             "audio_url": audio_url,
             "image_url": data.get("thumbnail") or "",
+            "is_carousel": len(media_items) > 1,
+            "media_items": media_items,
             "formats": formats,
         }
 
     finally:
         if cookie_path and cookie_path.exists():
             cookie_path.unlink(missing_ok=True)
-        try:
-            temp_dir.rmdir()
-        except OSError:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.post("/download")
 def download_media(request: DownloadRequest):
@@ -400,10 +598,83 @@ def download_media(request: DownloadRequest):
 
     validate_instagram_url(url)
 
+    if media_type == "image":
+        media_url = (request.media_url or "").strip()
+        validate_media_url(media_url)
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="instagram-image-"))
+        image_output = temp_dir / "instagram-image.bin"
+
+        image_request = urllib.request.Request(
+            media_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/153.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(image_request, timeout=60) as response:
+                content_type = (
+                    response.headers.get_content_type() or "application/octet-stream"
+                )
+                image_bytes = response.read()
+
+            if len(image_bytes) < 100:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Instagram image response was unexpectedly small."
+                )
+
+            if not (
+                image_bytes.startswith(b"\xff\xd8\xff")
+                or image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+                or (
+                    len(image_bytes) >= 12
+                    and image_bytes[:4] == b"RIFF"
+                    and image_bytes[8:12] == b"WEBP"
+                )
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Instagram response is not a supported image file."
+                )
+
+            extension = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+            }.get(content_type, ".img")
+
+            image_output = temp_dir / ("instagram-image" + extension)
+            image_output.write_bytes(image_bytes)
+
+            return FileResponse(
+                path=str(image_output),
+                media_type=content_type,
+                filename="instagram-image" + extension,
+                background=BackgroundTask(
+                    shutil.rmtree, temp_dir, ignore_errors=True
+                ),
+            )
+
+        except HTTPException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=502,
+                detail="Instagram image download failed."
+            )
+
     if media_type != "video":
         raise HTTPException(
             status_code=400,
-            detail="This endpoint currently supports video downloads."
+            detail="Supported media types are image and video."
         )
 
     if not audio_url:
@@ -426,9 +697,11 @@ def download_media(request: DownloadRequest):
     audio_output = temp_dir / "instagram-audio.m4a"
     merged_output = temp_dir / "instagram-video-audio.mp4"
 
-    cookie_path = prepare_instagram_cookies(temp_dir)
+    cookie_path = None
+    response_created = False
 
     try:
+        cookie_path = prepare_instagram_cookies(temp_dir)
         print("========================================", flush=True)
         print("1. DOWNLOAD VIDEO FROM RAILWAY", flush=True)
         print("========================================", flush=True)
@@ -561,15 +834,22 @@ def download_media(request: DownloadRequest):
             flush=True
         )
 
-        return FileResponse(
+        response = FileResponse(
             path=str(merged_output),
             media_type="video/mp4",
             filename="instagram-video.mp4",
+            background=BackgroundTask(
+                shutil.rmtree, temp_dir, ignore_errors=True
+            ),
         )
+        response_created = True
+        return response
 
     finally:
         if cookie_path and cookie_path.exists():
             cookie_path.unlink(missing_ok=True)
+        if not response_created:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 
