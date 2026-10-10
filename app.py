@@ -444,7 +444,8 @@ def metadata(url: str):
 
         command = [
             "yt-dlp",
-            "--no-playlist",
+            "--yes-playlist",
+            "--ignore-errors",
             "--skip-download",
             "--no-warnings",
             "--dump-single-json",
@@ -466,29 +467,42 @@ def metadata(url: str):
             suppress_output=True,
         )
 
-        if result.returncode != 0:
+        raw = result.stdout.strip()
+        media_items = extract_carousel_items(temp_dir)
+
+        if not raw:
+            if len(media_items) < 2:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Instagram metadata response was empty."
+                )
+
+            data = {
+                "id": url.rstrip("/").split("/")[-1],
+                "extractor": "Instagram",
+                "webpage_url": url,
+            }
+        else:
+            try:
+                data = parse_yt_dlp_json(raw)
+            except ValueError:
+                if len(media_items) < 2:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="yt-dlp returned invalid JSON."
+                    )
+
+                data = {
+                    "id": url.rstrip("/").split("/")[-1],
+                    "extractor": "Instagram",
+                    "webpage_url": url,
+                }
+
+        if result.returncode != 0 and len(media_items) < 2:
             raise HTTPException(
                 status_code=502,
                 detail="Instagram metadata extraction failed."
             )
-
-        raw = result.stdout.strip()
-
-        if not raw:
-            raise HTTPException(
-                status_code=502,
-                detail="Instagram metadata response was empty."
-            )
-
-        try:
-            data = parse_yt_dlp_json(raw)
-        except ValueError:
-            raise HTTPException(
-                status_code=502,
-                detail="yt-dlp returned invalid JSON."
-            )
-
-        media_items = extract_carousel_items(temp_dir)
         formats = []
 
         video_url = ""
@@ -850,7 +864,3 @@ def download_media(request: DownloadRequest):
             cookie_path.unlink(missing_ok=True)
         if not response_created:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-
-
